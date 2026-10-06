@@ -16,7 +16,7 @@ import { EPS, type Rect } from './geometry'
 import { buildSteps, simulate } from './cuts'
 import type { DSeg } from './cuts'
 
-interface Inst {
+export interface Inst {
   part: Part
   k: number // 第 k 件（qty 展开）
   key: string
@@ -52,10 +52,15 @@ interface SheetState {
 }
 
 function boardMatches(b: Board, p: Part): boolean {
+  return partMatchesBoard(p, b, boardDefs)
+}
+
+/** 件能否排上某板：未指定板种=任何板可；指定板种只认本板种，或同厚度余料小板。 */
+export function partMatchesBoard(p: Part, b: Board, boardById: Map<string, Board>): boolean {
   if (!p.boardId) return true
   if (b.id === p.boardId) return true
   if (b.kind === 'offcut') {
-    const target = boardDefs.get(p.boardId)
+    const target = boardById.get(p.boardId)
     return !!target && target.thicknessMm === b.thicknessMm
   }
   return false
@@ -64,15 +69,37 @@ function boardMatches(b: Board, p: Part): boolean {
 const boardDefs = new Map<string, Board>()
 
 /** 统一为横向板（长边沿 x）。余料上台可以转，所以归一化安全。 */
-function normalize(b: Board): Board {
+export function normalizeBoard(b: Board): Board {
   if (b.wMm >= b.hMm) return b
   return { ...b, wMm: b.hMm, hMm: b.wMm }
+}
+
+/** 展开零件实例（id#k）。排样与调板试算共用同一套展开，保证守恒口径一致。 */
+export function expandInstances(job: Job): Inst[] {
+  const insts: Inst[] = []
+  for (const p of job.parts) {
+    for (let k = 1; k <= Math.max(0, p.qty); k++) {
+      insts.push({ part: p, k, key: `${p.id}#${k}`, cabinet: p.cabinet || '未分组' })
+    }
+  }
+  return insts
+}
+
+/** 排样排序：按柜体批次分组时柜体优先；随后大边降序、面积降序（启发式，非判定）。 */
+function canonicalOrder(job: Job, insts: Inst[]): Inst[] {
+  return [...insts].sort((a, b) => {
+    if (job.batchByCabinet && a.cabinet !== b.cabinet) return a.cabinet < b.cabinet ? -1 : 1
+    const am = Math.max(a.part.lenMm, a.part.widMm)
+    const bm = Math.max(b.part.lenMm, b.part.widMm)
+    if (bm !== am) return bm - am
+    return b.part.lenMm * b.part.widMm - a.part.lenMm * a.part.widMm
+  })
 }
 
 export function nestJob(job: Job): NestResult {
   const t0 = performance.now()
   boardDefs.clear()
-  const boards = job.boards.map(normalize)
+  const boards = job.boards.map(normalizeBoard)
   boards.forEach((b) => boardDefs.set(b.id, b))
   const kerf = job.kerfMm
   const trim = job.trimMm
@@ -80,21 +107,9 @@ export function nestJob(job: Job): NestResult {
   // 各板种实际开板数（用于库存补采提示）
   const openedCount = new Map<string, number>()
 
-  // 零件实例展开
-  const insts: Inst[] = []
-  for (const p of job.parts) {
-    for (let k = 1; k <= Math.max(0, p.qty); k++) {
-      insts.push({ part: p, k, key: `${p.id}#${k}`, cabinet: p.cabinet || '未分组' })
-    }
-  }
-  // 排序：按柜体批次分组时柜体优先；随后大边降序、面积降序
-  const sorted = [...insts].sort((a, b) => {
-    if (job.batchByCabinet && a.cabinet !== b.cabinet) return a.cabinet < b.cabinet ? -1 : 1
-    const am = Math.max(a.part.lenMm, a.part.widMm)
-    const bm = Math.max(b.part.lenMm, b.part.widMm)
-    if (bm !== am) return bm - am
-    return b.part.lenMm * b.part.widMm - a.part.lenMm * a.part.widMm
-  })
+  // 零件实例展开 + 排序（同一份展开/排序口径，连锁试算也走这里）
+  const insts = expandInstances(job)
+  const sorted = canonicalOrder(job, insts)
 
   const sheets: SheetState[] = []
   let frSeq = 0
@@ -229,89 +244,26 @@ export function nestJob(job: Job): NestResult {
       fr = s.free[0]
     }
     const o = best.o
-    // 占用该空档并按 guillotine 递归二分拆出余隙
+    // 占用该空档并按 guillotine 递归二分拆出余隙（拆分实现全应用唯一，见 splitFreeRect）
     s.free = s.free.filter((f) => f.id !== fr.id)
+    const parentDeps = segDepsOf(fr, s)
+    const split = splitFreeRect(fr, o.pw, o.ph, kerf, parentDeps)
     const rec: Rec = {
       id: s.recs.length,
       frId: fr.id,
       instKey: inst.key,
-      x: fr.x,
-      y: fr.y,
-      pw: o.pw,
-      ph: o.ph,
-      dir: fr.w >= fr.h ? 'v' : 'h'
+      x: split.x,
+      y: split.y,
+      pw: split.pw,
+      ph: split.ph,
+      dir: split.dir,
+      segA: split.segA,
+      segB: split.segB
     }
     const addFree = (r: Rect, parentRec: number, entrySeg: 'A' | 'B'): void => {
       if (r.w >= 1 && r.h >= 1) s.free.push({ ...r, id: frSeq++, parentRec, entrySeg })
     }
-    const parentDeps = segDepsOf(fr, s)
-    const gx = fr.w - o.pw // 右侧余隙（≈0 或 ≥kerf）
-    const gy = fr.h - o.ph // 上方余隙（≈0 或 ≥kerf）
-    const cutX = gx >= kerf - EPS
-    const cutY = gy >= kerf - EPS
-    if (rec.dir === 'v') {
-      // 先竖切贯通全高（segA），再在含零件的左条内横切（segB）
-      if (cutX) {
-        rec.segA = {
-          axis: 'v',
-          at: fr.x + o.pw + kerf / 2,
-          lo: fr.y,
-          hi: fr.y + fr.h,
-          deps: parentDeps
-        }
-      }
-      if (cutY) {
-        rec.segB = {
-          axis: 'h',
-          at: fr.y + o.ph + kerf / 2,
-          lo: fr.x,
-          hi: cutX ? fr.x + o.pw : fr.x + fr.w,
-          deps: rec.segA ? [rec.segA] : parentDeps
-        }
-      }
-      // 左条上方空档需要 segB；右侧整条空档只需要 segA
-      if (cutY) {
-        addFree(
-          { x: fr.x, y: fr.y + o.ph + kerf, w: cutX ? o.pw : fr.w, h: gy - kerf },
-          rec.id,
-          'B'
-        )
-      }
-      if (cutX) {
-        addFree({ x: fr.x + o.pw + kerf, y: fr.y, w: gx - kerf, h: fr.h }, rec.id, 'A')
-      }
-    } else {
-      // 先横切贯通全宽（segA），再在含零件的下条内竖切（segB）
-      if (cutY) {
-        rec.segA = {
-          axis: 'h',
-          at: fr.y + o.ph + kerf / 2,
-          lo: fr.x,
-          hi: fr.x + fr.w,
-          deps: parentDeps
-        }
-      }
-      if (cutX) {
-        rec.segB = {
-          axis: 'v',
-          at: fr.x + o.pw + kerf / 2,
-          lo: fr.y,
-          hi: cutY ? fr.y + o.ph : fr.y + fr.h,
-          deps: rec.segA ? [rec.segA] : parentDeps
-        }
-      }
-      // 上方整条空档只需要 segA；下条右侧空档需要 segB
-      if (cutY) {
-        addFree({ x: fr.x, y: fr.y + o.ph + kerf, w: fr.w, h: gy - kerf }, rec.id, 'A')
-      }
-      if (cutX) {
-        addFree(
-          { x: fr.x + o.pw + kerf, y: fr.y, w: gx - kerf, h: cutY ? o.ph : fr.h },
-          rec.id,
-          'B'
-        )
-      }
-    }
+    for (const f of split.frees) addFree(f.r, rec.id, f.entrySeg)
     s.recs.push(rec)
     seq++
     s.placements.push({
@@ -338,28 +290,6 @@ export function nestJob(job: Job): NestResult {
   // 组装 SheetResult
   const results: SheetResult[] = sheets.map((s) => buildSheet(s, kerf, trim))
 
-  // 统计
-  const boardsByType: Record<string, number> = {}
-  let totalCost = 0
-  for (const s of results) {
-    boardsByType[s.boardName] = (boardsByType[s.boardName] ?? 0) + 1
-    totalCost += s.priceCents
-  }
-  let exposedM = 0
-  let normalM = 0
-  for (const s of results) {
-    for (const pl of s.placements) {
-      const m =
-        (pl.origLen *
-          ((pl.edgeBands.includes('top') ? 1 : 0) + (pl.edgeBands.includes('bottom') ? 1 : 0)) +
-          pl.origWid *
-            ((pl.edgeBands.includes('left') ? 1 : 0) + (pl.edgeBands.includes('right') ? 1 : 0))) /
-        1000
-      if (pl.exposed) exposedM += m
-      else normalM += m
-    }
-  }
-
   const unplacedList: UnplacedInfo[] = [...unplaced.values()].map((u) => ({
     partId: u.part.id,
     code: u.part.code,
@@ -373,42 +303,86 @@ export function nestJob(job: Job): NestResult {
           : '因纹理要求为横纹（不可旋转），现有板材排不下'
   }))
 
-  const baselineBoards = shelfBaseline(job, boards, kerf, trim, results.length)
-  const optimizedBoards = results.length
-  const savedBoards = Math.max(0, baselineBoards - optimizedBoards)
-  const stockShortage = boards
-    .filter((b) => b.kind !== 'offcut' && b.quantity > 0)
-    .map((b) => ({
-      boardId: b.id,
-      boardName: b.name,
-      need: openedCount.get(b.id) ?? 0,
-      have: b.quantity
-    }))
-    .filter((x) => x.need > x.have)
+  return finalizeNestResult(
+    job,
+    results,
+    unplacedList,
+    openedCount,
+    Math.round(performance.now() - t0),
+    Date.now()
+  )
+}
 
-  const stockUsed = results.filter((s) => s.priceCents > 0)
-  const avgPrice =
-    stockUsed.length > 0
-      ? stockUsed.reduce((a, s) => a + s.priceCents, 0) / stockUsed.length
-      : job.boards.reduce((a, b) => a + b.priceCents, 0) / Math.max(1, job.boards.length)
+/**
+ * guillotine 余隙递归二分（全应用唯一实现：主排样与连锁试排都走这里）。
+ * 把零件 (pw×ph) 放进空档 fr 的左下角，产出首刀/次刀与剩余空档。
+ * v：先竖切贯通全高（segA），再在含件左条内横切（segB）；h 对称。
+ * 判定口径与原排样一致：0<余隙<锯路 时不下刀（上层用 fitsClean 拦）。
+ */
+export interface FreeSplitResult {
+  x: number
+  y: number
+  pw: number
+  ph: number
+  dir: 'v' | 'h'
+  segA?: DSeg
+  segB?: DSeg
+  frees: { r: Rect; entrySeg: 'A' | 'B' }[]
+}
 
-  return {
-    sheets: results,
-    boardsUsed: optimizedBoards,
-    boardsByType,
-    edgeBandM: {
-      exposed: Math.round(exposedM * 100) / 100,
-      normal: Math.round(normalM * 100) / 100
-    },
-    unplaced: unplacedList,
-    baselineBoards,
-    savedBoards,
-    savedCents: Math.round(savedBoards * avgPrice),
-    totalCostCents: totalCost,
-    stockShortage,
-    elapsedMs: Math.round(performance.now() - t0),
-    generatedAt: Date.now()
+export function splitFreeRect(
+  fr: FRect,
+  pw: number,
+  ph: number,
+  kerf: number,
+  parentDeps: DSeg[]
+): FreeSplitResult {
+  const gx = fr.w - pw // 右侧余隙（≈0 或 ≥kerf）
+  const gy = fr.h - ph // 上方余隙（≈0 或 ≥kerf）
+  const cutX = gx >= kerf - EPS
+  const cutY = gy >= kerf - EPS
+  const dir: 'v' | 'h' = fr.w >= fr.h ? 'v' : 'h'
+  const frees: { r: Rect; entrySeg: 'A' | 'B' }[] = []
+  let segA: DSeg | undefined
+  let segB: DSeg | undefined
+  if (dir === 'v') {
+    if (cutX)
+      segA = { axis: 'v', at: fr.x + pw + kerf / 2, lo: fr.y, hi: fr.y + fr.h, deps: parentDeps }
+    if (cutY)
+      segB = {
+        axis: 'h',
+        at: fr.y + ph + kerf / 2,
+        lo: fr.x,
+        hi: cutX ? fr.x + pw : fr.x + fr.w,
+        deps: segA ? [segA] : parentDeps
+      }
+    // 左条上方空档需要 segB；右侧整条空档只需要 segA
+    if (cutY)
+      frees.push({
+        r: { x: fr.x, y: fr.y + ph + kerf, w: cutX ? pw : fr.w, h: gy - kerf },
+        entrySeg: 'B'
+      })
+    if (cutX) frees.push({ r: { x: fr.x + pw + kerf, y: fr.y, w: gx - kerf, h: fr.h }, entrySeg: 'A' })
+  } else {
+    if (cutY)
+      segA = { axis: 'h', at: fr.y + ph + kerf / 2, lo: fr.x, hi: fr.x + fr.w, deps: parentDeps }
+    if (cutX)
+      segB = {
+        axis: 'v',
+        at: fr.x + pw + kerf / 2,
+        lo: fr.y,
+        hi: cutY ? fr.y + ph : fr.y + fr.h,
+        deps: segA ? [segA] : parentDeps
+      }
+    // 上方整条空档只需要 segA；下条右侧空档需要 segB
+    if (cutY) frees.push({ r: { x: fr.x, y: fr.y + ph + kerf, w: fr.w, h: gy - kerf }, entrySeg: 'A' })
+    if (cutX)
+      frees.push({
+        r: { x: fr.x + pw + kerf, y: fr.y, w: gx - kerf, h: cutY ? ph : fr.h },
+        entrySeg: 'B'
+      })
   }
+  return { x: fr.x, y: fr.y, pw, ph, dir, segA, segB, frees }
 }
 
 /** 沿父放置的切割线建立依赖：进入空档前要求对应首刀/次刀已完成。 */
@@ -465,6 +439,264 @@ function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
     console.error(`[排样] 第 ${s.index + 1} 张板切割模拟失败`, sim.errors)
   }
   return sheet
+}
+
+// —— 连锁挪件试算：同一套余隙/锯路/修边/贯通判定，把指定一组件排进上限张数的同规格板 ——
+
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+export interface FixedPackStrategy {
+  name: string
+  order: (insts: Inst[]) => Inst[]
+}
+
+function shuffleInst(insts: Inst[], seed: number): Inst[] {
+  const a = [...insts]
+  const rng = mulberry32(seed)
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1))
+    ;[a[i], a[j]] = [a[j], a[i]]
+  }
+  return a
+}
+
+/** 连锁试算的换序策略：只改尝试顺序，判定（fitsClean/余隙/贯通）一概不变。 */
+export const FIXED_PACK_STRATEGIES: FixedPackStrategy[] = [
+  {
+    name: '大边降序（标准）',
+    order: (is) =>
+      [...is].sort(
+        (a, b) =>
+          Math.max(b.part.lenMm, b.part.widMm) - Math.max(a.part.lenMm, a.part.widMm) ||
+          b.part.lenMm * b.part.widMm - a.part.lenMm * a.part.widMm
+      )
+  },
+  {
+    name: '面积降序',
+    order: (is) => [...is].sort((a, b) => b.part.lenMm * b.part.widMm - a.part.lenMm * a.part.widMm)
+  },
+  {
+    name: '长边降序',
+    order: (is) =>
+      [...is].sort((a, b) => b.part.lenMm - a.part.lenMm || b.part.widMm - a.part.widMm)
+  },
+  {
+    name: '短边降序',
+    order: (is) =>
+      [...is].sort((a, b) => b.part.widMm - a.part.widMm || b.part.lenMm - a.part.lenMm)
+  },
+  { name: '定种洗牌 1', order: (is) => shuffleInst(is, 0x51a7) },
+  { name: '定种洗牌 2', order: (is) => shuffleInst(is, 0xb00c) }
+]
+
+function orientOfPart(p: Part): { pw: number; ph: number; rotated: boolean }[] {
+  if (p.grain === 'length') return [{ pw: p.lenMm, ph: p.widMm, rotated: false }]
+  if (p.grain === 'width') return [{ pw: p.widMm, ph: p.lenMm, rotated: false }]
+  if (p.lenMm === p.widMm) return [{ pw: p.lenMm, ph: p.widMm, rotated: false }]
+  return [
+    { pw: p.lenMm, ph: p.widMm, rotated: false },
+    { pw: p.widMm, ph: p.lenMm, rotated: true }
+  ]
+}
+
+function fitsGap(avail: number, size: number, kerf: number): boolean {
+  const gap = avail - size
+  return gap >= -EPS && (gap <= EPS || gap >= kerf - EPS)
+}
+
+/**
+ * 把一组件排进同规格板，最多用 maxSheets 张；按给定策略逐一试。
+ * 返回第一个不超上限的方案（张数相同时取走刀更少的）；全部超上限返回 null。
+ * 余隙拆分、锯路、修边、贯通刀依赖与 nestJob 完全相同（splitFreeRect）。
+ */
+export function packFixedBoards(
+  boardInput: Board,
+  insts: Inst[],
+  kerf: number,
+  trim: number,
+  maxSheets: number,
+  strategies: FixedPackStrategy[] = FIXED_PACK_STRATEGIES
+): SheetResult[] | null {
+  const board = normalizeBoard(boardInput)
+  for (const st of strategies) {
+    const states = packOneOrder(board, st.order(insts), kerf, trim, maxSheets)
+    if (states && states.length <= maxSheets) {
+      return states.map((s) => buildSheet(s, kerf, trim))
+    }
+  }
+  return null
+}
+
+function packOneOrder(
+  b: Board,
+  order: Inst[],
+  kerf: number,
+  trim: number,
+  maxSheets: number
+): SheetState[] | null {
+  const states: SheetState[] = []
+  let frSeqLocal = 0
+  let seq = 0
+  const open = (): SheetState => {
+    const usable: Rect = {
+      x: trim,
+      y: trim,
+      w: Math.max(1, b.wMm - 2 * trim),
+      h: Math.max(1, b.hMm - 2 * trim)
+    }
+    const s: SheetState = {
+      board: b,
+      index: states.length,
+      usable,
+      free: [{ id: frSeqLocal++, x: usable.x, y: usable.y, w: usable.w, h: usable.h, parentRec: null, entrySeg: null }],
+      recs: [],
+      placements: []
+    }
+    states.push(s)
+    return s
+  }
+  for (const inst of order) {
+    const p = inst.part
+    let chosen: { s: SheetState; fr: FRect; pw: number; ph: number; rotated: boolean; waste: number } | null = null
+    for (const s of states) {
+      for (const o of orientOfPart(p)) {
+        for (const fr of s.free) {
+          if (fitsGap(fr.w, o.pw, kerf) && fitsGap(fr.h, o.ph, kerf)) {
+            const waste = fr.w * fr.h - o.pw * o.ph
+            if (!chosen || waste < chosen.waste)
+              chosen = { s, fr, pw: o.pw, ph: o.ph, rotated: o.rotated, waste }
+          }
+        }
+      }
+    }
+    if (!chosen) {
+      if (states.length >= maxSheets) return null
+      const s = open()
+      const fr = s.free[0]
+      const o = orientOfPart(p).find((oo) => fitsGap(fr.w, oo.pw, kerf) && fitsGap(fr.h, oo.ph, kerf))
+      if (!o) return null // 件本身比板大（分组时已排除，理论不到这）
+      chosen = { s, fr, pw: o.pw, ph: o.ph, rotated: o.rotated, waste: 0 }
+    }
+    const { s, fr } = chosen
+    s.free = s.free.filter((f) => f.id !== fr.id)
+    const deps = segDepsOf(fr, s)
+    const split = splitFreeRect(fr, chosen.pw, chosen.ph, kerf, deps)
+    const rec: Rec = {
+      id: s.recs.length,
+      frId: fr.id,
+      instKey: inst.key,
+      x: split.x,
+      y: split.y,
+      pw: split.pw,
+      ph: split.ph,
+      dir: split.dir,
+      segA: split.segA,
+      segB: split.segB
+    }
+    for (const f of split.frees) {
+      if (f.r.w >= 1 && f.r.h >= 1)
+        s.free.push({ ...f.r, id: frSeqLocal++, parentRec: rec.id, entrySeg: f.entrySeg })
+    }
+    s.recs.push(rec)
+    seq++
+    s.placements.push({
+      partId: p.id,
+      instanceId: inst.key,
+      boardIndex: s.index,
+      x: fr.x,
+      y: fr.y,
+      lenMm: chosen.pw,
+      widMm: chosen.ph,
+      origLen: p.lenMm,
+      origWid: p.widMm,
+      rotated: chosen.rotated,
+      seq,
+      code: p.code,
+      name: p.name,
+      cabinet: inst.cabinet,
+      exposed: p.exposed,
+      grain: p.grain,
+      edgeBands: p.edgeBands
+    })
+  }
+  return states
+}
+
+/** 汇总统计（主排样与调板确认共用，保证各处取数同源）。 */
+export function finalizeNestResult(
+  job: Job,
+  sheets: SheetResult[],
+  unplacedList: UnplacedInfo[],
+  openedCount: Map<string, number>,
+  elapsedMs: number,
+  generatedAt: number
+): NestResult {
+  const boardsByType: Record<string, number> = {}
+  let totalCost = 0
+  for (const s of sheets) {
+    boardsByType[s.boardName] = (boardsByType[s.boardName] ?? 0) + 1
+    totalCost += s.priceCents
+  }
+  let exposedM = 0
+  let normalM = 0
+  for (const s of sheets) {
+    for (const pl of s.placements) {
+      const m =
+        (pl.origLen *
+          ((pl.edgeBands.includes('top') ? 1 : 0) + (pl.edgeBands.includes('bottom') ? 1 : 0)) +
+          pl.origWid *
+            ((pl.edgeBands.includes('left') ? 1 : 0) + (pl.edgeBands.includes('right') ? 1 : 0))) /
+        1000
+      if (pl.exposed) exposedM += m
+      else normalM += m
+    }
+  }
+  const stockShortage = job.boards
+    .filter((b) => b.kind !== 'offcut' && b.quantity > 0)
+    .map((b) => ({
+      boardId: b.id,
+      boardName: b.name,
+      need: openedCount.get(b.id) ?? 0,
+      have: b.quantity
+    }))
+    .filter((x) => x.need > x.have)
+
+  const stockUsed = sheets.filter((s) => s.priceCents > 0)
+  const avgPrice =
+    stockUsed.length > 0
+      ? stockUsed.reduce((a, s) => a + s.priceCents, 0) / stockUsed.length
+      : job.boards.reduce((a, b) => a + b.priceCents, 0) / Math.max(1, job.boards.length)
+
+  const optimizedBoards = sheets.length
+  const baselineBoards = shelfBaseline(job, job.boards.map(normalizeBoard), job.kerfMm, job.trimMm, optimizedBoards)
+  const savedBoards = Math.max(0, baselineBoards - optimizedBoards)
+
+  return {
+    sheets,
+    boardsUsed: optimizedBoards,
+    boardsByType,
+    edgeBandM: {
+      exposed: Math.round(exposedM * 100) / 100,
+      normal: Math.round(normalM * 100) / 100
+    },
+    unplaced: unplacedList,
+    baselineBoards,
+    savedBoards,
+    savedCents: Math.round(savedBoards * avgPrice),
+    totalCostCents: totalCost,
+    stockShortage,
+    elapsedMs,
+    generatedAt
+  }
 }
 
 /**

@@ -126,7 +126,11 @@ const boardByName = (name: string) =>
     <div v-if="sections.has('order')">
       <section class="print-page">
         <h2>下料单 / 领料单</h2>
-        <p class="doc-meta">项目：{{ job.name }} ｜ 打印时间：{{ now }}</p>
+        <p class="doc-meta">
+          项目：{{ job.name }} ｜ 打印时间：{{ now }}<br />
+          共 <b>{{ job.result?.sheets.length ?? 0 }}</b> 张板、<b>{{ allInstances.length }}</b> 件零件
+          ｜ 结果版本 rev {{ job.result?.rev ?? 0 }}（重排/微调/调板后请以新版本重新打印，旧单作废）
+        </p>
 
         <h3>一、板材领料</h3>
         <table class="pgrid">
@@ -192,6 +196,7 @@ const boardByName = (name: string) =>
     <!-- 标签（A4 不干胶，每块一张） -->
     <div v-if="sections.has('labels')">
       <section class="print-page labels-page">
+        <p class="labels-head">零件标签 · 共 {{ allInstances.length }} 张（每块零件一张）· 结果 rev {{ job.result?.rev ?? 0 }}</p>
         <div
           v-for="(p, i) in allInstances"
           :key="'lb' + i"
@@ -253,6 +258,11 @@ table.pgrid th {
   grid-template-columns: repeat(2, 94mm);
   gap: 4mm 6mm;
   justify-content: center;
+}
+.labels-head {
+  grid-column: 1 / -1;
+  font-size: 12px;
+  margin: 0 0 2mm;
 }
 .label-card {
   border: 1.5px solid #000;

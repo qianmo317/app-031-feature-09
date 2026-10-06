@@ -60,7 +60,7 @@ export function guillotineViolation(
 
 function recurseCheck(rects: PlacedRect[], bounds: Rect, kerf: number): boolean {
   if (rects.length <= 1) return true
-  // 候选竖切线：任意零件右边沿（+锯路）
+  // 候选竖切线：任意零件右边沿（+锯路）。hasGap 已保证另一侧零件净距 ≥ kerf(容差)
   const cutsV = collectCuts(rects, bounds, 'v', kerf)
   for (const at of cutsV) {
     const left = rects.filter((r) => r.x + r.w <= at + EPS)
@@ -92,15 +92,15 @@ function collectCuts(rects: PlacedRect[], bounds: Rect, axis: 'v' | 'h', kerf: n
     const edge = axis === 'v' ? r.x + r.w : r.y + r.h
     const at = edge + kerf / 2
     if (at > spanStart + EPS && at < spanStart + spanSize - EPS) {
-      // 该位置必须存在一条“锯路间隙”：左右（上下）零件之间至少有 kerf 间隔
+      // 该位置必须存在一条“锯路间隙”：左右（上下）零件净距 ≥ 锯路（0.6mm 取整容差）
       const hasGap = rects.every((o) => {
         if (axis === 'v') {
           const leftSide = o.x + o.w <= edge + EPS
-          const rightSide = o.x >= edge + kerf - EPS
+          const rightSide = o.x >= edge + kerf - 0.6
           return leftSide || rightSide
         }
         const beforeSide = o.y + o.h <= edge + EPS
-        const afterSide = o.y >= edge + kerf - EPS
+        const afterSide = o.y >= edge + kerf - 0.6
         return beforeSide || afterSide
       })
       if (hasGap) out.add(Math.round(at * 10) / 10)

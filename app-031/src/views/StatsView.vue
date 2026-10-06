@@ -3,15 +3,22 @@ import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { getJob } from '../lib/store'
 import boardsData from '../data/boards.json'
-import { pct, money } from '../lib/format'
+import { money } from '../lib/format'
+import {
+  boardMaterialRows,
+  fmtM2,
+  fmtUtil,
+  overallUtilization,
+  sawOps,
+  totalPartCount,
+  usableOffcutAreaMm2
+} from '../lib/metrics'
 
 const route = useRoute()
 const job = computed(() => getJob(route.params.id as string))
 const result = computed(() => job.value?.result)
 
-const totalPieces = computed(
-  () => result.value?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0
-)
+const totalPieces = computed(() => (result.value ? totalPartCount(result.value) : 0))
 const totalEdgeM = computed(
   () => (result.value?.edgeBandM.exposed ?? 0) + (result.value?.edgeBandM.normal ?? 0)
 )
@@ -30,19 +37,18 @@ const hardware = computed(() => {
   ]
 })
 
-const usableOffcuts = computed(() => {
-  const all = result.value?.sheets.flatMap((s, si) =>
-    s.offcuts.filter((o) => o.usable).map((o) => ({ ...o, sheet: si + 1 }))
-  ) ?? []
-  return { list: all, area: all.reduce((a, o) => a + o.areaMm2, 0) }
-})
+const rows = computed(() => (result.value ? boardMaterialRows(result.value) : []))
+const usableOffcuts = computed(() => ({
+  list: rows.value.flatMap((r) =>
+    (result.value?.sheets[r.index]?.offcuts ?? [])
+      .filter((o) => o.usable)
+      .map((o) => ({ ...o, sheet: r.index + 1 }))
+  ),
+  area: result.value ? usableOffcutAreaMm2(result.value) : 0
+}))
 
-const overallUtil = computed(() => {
-  if (!result.value || result.value.sheets.length === 0) return 0
-  const used = result.value.sheets.reduce((a, s) => a + s.usedAreaMm2, 0)
-  const total = result.value.sheets.reduce((a, s) => a + s.boardAreaMm2, 0)
-  return total > 0 ? used / total : 0
-})
+const overallUtil = computed(() => (result.value ? overallUtilization(result.value) : 0))
+const sawCount = computed(() => (result.value ? sawOps(result.value) : 0))
 const utilMinMax = computed(() => {
   const us = result.value?.sheets.map((s) => s.utilization) ?? []
   if (us.length === 0) return { min: 0, max: 0 }
@@ -62,8 +68,13 @@ const utilMinMax = computed(() => {
         </h2>
         <p class="muted">
           朴素顺板需要 {{ result.baselineBoards }} 张（原清单顺序、不旋转、货架式摆法）；
-          本方案综合利用率 {{ pct(overallUtil) }}，
-          单板区间 {{ pct(utilMinMax.min) }} ~ {{ pct(utilMinMax.max) }}。
+          本方案综合利用率 {{ fmtUtil(overallUtil) }}，
+          单板区间 {{ fmtUtil(utilMinMax.min) }} ~ {{ fmtUtil(utilMinMax.max) }}，
+          车间走刀 {{ sawCount }} 次（同规格修边叠切计 1 次），共 {{ totalPieces }} 件。
+        </p>
+        <p class="small muted">
+          口径：面积按 mm² 累计再换算 m²（保留 2 位小数）；利用率保留 1 位小数；
+          利用率分子为零件净面积（不含锯路）；余料尺寸整 mm，两边 ≥300mm 记可用。
         </p>
       </div>
     </section>
@@ -95,6 +106,45 @@ const utilMinMax = computed(() => {
           </tfoot>
         </table>
         <p class="small muted" style="margin-top: 8px">排样计算耗时 {{ result.elapsedMs }}ms。</p>
+      </section>
+
+      <section class="panel" style="grid-column: 1 / -1">
+        <h3>按板汇总用料与余料（{{ rows.length }} 张 / {{ totalPieces }} 件）</h3>
+        <table class="grid">
+          <thead>
+            <tr>
+              <th>板</th><th>板材</th><th>规格(mm)</th><th>件数</th>
+              <th>用料(m²)</th><th>浪费(m²)</th><th>可用余料(m²)</th>
+              <th>利用率</th><th>走刀(次)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in rows" :key="r.index">
+              <td>第 {{ r.index + 1 }} 张</td>
+              <td>{{ r.boardName }}</td>
+              <td>{{ r.spec }}×{{ r.thicknessMm }}</td>
+              <td>{{ r.pieces }}</td>
+              <td>{{ fmtM2(r.usedAreaMm2) }}</td>
+              <td>{{ fmtM2(r.wasteMm2) }}</td>
+              <td>{{ fmtM2(r.offcutAreaMm2) }}</td>
+              <td>{{ fmtUtil(r.utilization) }}</td>
+              <td>{{ r.sawOps }}</td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr>
+              <td colspan="4"><b>合计 {{ rows.length }} 张 / {{ totalPieces }} 件</b></td>
+              <td><b>{{ fmtM2(rows.reduce((a, r) => a + r.usedAreaMm2, 0)) }}</b></td>
+              <td><b>{{ fmtM2(rows.reduce((a, r) => a + r.wasteMm2, 0)) }}</b></td>
+              <td><b>{{ fmtM2(usableOffcuts.area) }}</b></td>
+              <td><b>{{ fmtUtil(overallUtil) }}</b></td>
+              <td><b>{{ sawCount }}</b></td>
+            </tr>
+          </tfoot>
+        </table>
+        <p class="small muted" style="margin-top: 6px">
+          本表与排样结果页、下料单/标签打印、本机存档取同一批数（rev {{ result.rev ?? 0 }}）。
+        </p>
       </section>
 
       <section class="panel">
@@ -133,7 +183,7 @@ const utilMinMax = computed(() => {
 
       <section class="panel">
         <h3>可再利用余料（≥300×300mm）</h3>
-        <p>{{ usableOffcuts.list.length }} 块，合计 {{ (usableOffcuts.area / 1e6).toFixed(2) }}m²</p>
+        <p>{{ usableOffcuts.list.length }} 块，合计 {{ fmtM2(usableOffcuts.area) }}m²</p>
         <table class="grid">
           <thead>
             <tr><th>所在板</th><th>尺寸(mm)</th><th>面积</th></tr>
@@ -142,7 +192,7 @@ const utilMinMax = computed(() => {
             <tr v-for="(o, i) in usableOffcuts.list.slice(0, 8)" :key="i">
               <td>第 {{ o.sheet }} 张</td>
               <td>{{ o.wMm }}×{{ o.hMm }}</td>
-              <td>{{ (o.areaMm2 / 1e6).toFixed(2) }}m²</td>
+              <td>{{ fmtM2(o.areaMm2) }}m²</td>
             </tr>
           </tbody>
         </table>

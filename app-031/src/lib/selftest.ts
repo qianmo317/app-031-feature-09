@@ -2,9 +2,13 @@
 // guillotine 100 组随机零反例、纹理零旋转、锯路/修边、守恒、封边复算、
 // 30 零件锯切工步 ≤20 且模拟器还原、余料再利用、300 零件性能 <1.5s。
 import type { Board, Job, Part } from '../types'
-import { nestJob } from './packing'
-import { simulate, countSawOps } from './cuts'
+import { nestJob, packFixedBoards, expandInstances } from './packing'
+import { simulate, countSawOps, rebuildFromPlacements } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import { analyzeRemix, planLocalMove } from './remix'
+import { verifyResult } from './verify'
+import { boardMaterialRows } from './metrics'
+import type { SheetResult } from '../types'
 
 export interface CheckResult {
   name: string
@@ -438,6 +442,170 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 连锁试排：标准序排不满时，多策略定板搜索能把同组压进 n-1 张（判定口径不变）
+  {
+    // 标准「大边降序」把这 3 件排到 2 张（872×671 / 982×628 / 857×938），
+    // 但存在一张装法；多策略定板试排（换序，不改判定）能压进 1 张。
+    const board = makeBoard({ id: 'chain_b', wMm: 2440, hMm: 1220 })
+    const insts = expandInstances(
+      makeJob([
+        makePart({ code: 'A', lenMm: 872, widMm: 671, qty: 1 }),
+        makePart({ code: 'B', lenMm: 982, widMm: 628, qty: 1 }),
+        makePart({ code: 'C', lenMm: 857, widMm: 938, qty: 1 })
+      ])
+    )
+    const stdJob = makeJob(
+      [
+        makePart({ code: 'A', lenMm: 872, widMm: 671, qty: 1 }),
+        makePart({ code: 'B', lenMm: 982, widMm: 628, qty: 1 }),
+        makePart({ code: 'C', lenMm: 857, widMm: 938, qty: 1 })
+      ],
+      { boards: [board] }
+    )
+    const stdSheets = nestJob(stdJob).sheets.length
+    const packed = packFixedBoards(board, insts, 3.2, 8, 1)
+    let allSimOk = false
+    if (packed && packed.length === 1) {
+      allSimOk = simulate(2440, 1220, 3.2, packed[0].steps, packed[0].placements).ok
+    }
+    add(
+      '连锁多策略定板试排：标准 2 张的组压进 1 张且逐刀模拟合法',
+      stdSheets === 2 && !!packed && packed.length === 1 && allSimOk,
+      `标准序 ${stdSheets} 张；试排 ${packed ? packed.length + ' 张' : '失败'}，模拟 ${allSimOk ? '通过' : '失败'}`
+    )
+  }
+
+  // 11) 连锁诊断：全部板不低于下限时 lowSheets 为空；有低板时划不来要给原因
+  {
+    const job = makeJob([
+      makePart({ code: 'A', lenMm: 800, widMm: 600, qty: 1 }),
+      makePart({ code: 'B', lenMm: 800, widMm: 600, qty: 1 }),
+      makePart({ code: 'C', lenMm: 1200, widMm: 1000, qty: 1 })
+    ])
+    const r = nestJob(job)
+    job.result = r
+    const rep90 = analyzeRemix(job, r, 90, job.boards)
+    const lowCount = rep90.lowSheets.length
+    // 下限设到不可能达到的 99% 时，每张板都被挑出，且同板种组试排压不进 n-1 必须给原因
+    const rep99 = analyzeRemix(job, r, 99, job.boards)
+    const reasonOk = rep99.sheets.every(
+      (s) => s.chain.feasible === false && s.chain.reason.length > 0
+    )
+    add(
+      '低利用率诊断：按下限挑板，划不来的连锁写明原因',
+      lowCount >= 0 && rep99.lowSheets.length === r.sheets.length && reasonOk,
+      `下限90%挑出 ${lowCount} 张；下限99%挑出 ${rep99.lowSheets.length}/${r.sheets.length}，原因 ${reasonOk ? '齐全' : '缺失'}`
+    )
+  }
+
+  // 12) 总校验抓篡改：伪造重叠布局必须被 verifyResult 拦下
+  {
+    const job = makeJob([makePart({ code: 'X', lenMm: 400, widMm: 300 })])
+    const r = nestJob(job)
+    job.result = r
+    const sheet = r.sheets[0]
+    // 复制一个件并故意叠到第一件上
+    const dup = { ...sheet.placements[0], instanceId: 'p_dup#1', x: 10, y: 10 }
+    const tampered: Job = {
+      ...job,
+      result: { ...r, sheets: [{ ...sheet, placements: [...sheet.placements, dup] }] }
+    }
+    const ver = verifyResult(tampered, tampered.result!, 2)
+    add(
+      '调板写回总校验能抓重叠/重复件（不会把非法布局写进结果）',
+      !ver.ok,
+      ver.ok ? '篡改布局被错误放行' : `已拦下：${ver.issues[0]?.detail ?? '非法'}`
+    )
+  }
+
+  // 13b) 路线一（板上对换）内核链路：手工合法布局上挪一件进空块、取空施主板，省一张且校验通过
+  {
+    const board = makeBoard({ id: 'loc_b', wMm: 2440, hMm: 1220 })
+    const job = makeJob(
+      [
+        makePart({ code: 'BIG', lenMm: 1836, widMm: 490 }),
+        makePart({ code: 'T', lenMm: 496, widMm: 1000 })
+      ],
+      { boards: [board] }
+    )
+    const r = nestJob(job)
+    job.result = r
+    let ok = false
+    let detail = '用例未执行'
+    if (r.sheets.length === 1) {
+      const src = r.sheets[0]
+      const tall = src.placements.find((p) => p.code === 'T')!
+      const big = src.placements.find((p) => p.code === 'BIG')!
+      const toOc = (rs: Rect[]) =>
+        rs
+          .filter((x) => x.w >= 2 && x.h >= 2)
+          .map((x) => ({
+            x: Math.round(x.x),
+            y: Math.round(x.y),
+            wMm: Math.round(x.w),
+            hMm: Math.round(x.h),
+            areaMm2: Math.round(x.w * x.h),
+            usable: x.w >= 300 - 0.05 && x.h >= 300 - 0.05
+          }))
+          .sort((a, b) => b.areaMm2 - a.areaMm2)
+      // 手工两张：板0 只有 BIG；板1 只放高件 T（500×1000）占左竖条，
+      // 右条全高 1921×1204 整块空出（X 留在板0 同 BIG 一起）
+      const firstPlacements = [{ ...big, x: 8, y: 8 }]
+      const secondPlacements = [{ ...tall, x: 8, y: 212 }]
+      const rb0 = rebuildFromPlacements(2440, 1220, 3.2, 8, 0, firstPlacements)
+      const rb1 = rebuildFromPlacements(2440, 1220, 3.2, 8, 1, secondPlacements)
+      if (rb0 && rb1) {
+        r.sheets = [
+          { ...src, index: 0, placements: firstPlacements.map((p) => ({ ...p, adjusted: true })), steps: rb0.steps, offcuts: toOc(rb0.leftovers) },
+          { ...src, index: 1, placements: secondPlacements.map((p) => ({ ...p, adjusted: true })), steps: rb1.steps, offcuts: toOc(rb1.leftovers) }
+        ]
+        const plan = planLocalMove(job, r, 1, big.instanceId)
+        if ('error' in plan) {
+          detail = plan.error
+        } else {
+          const after: SheetResult[] = []
+          r.sheets.forEach((s, i) => {
+            if (i === plan.targetIdx) after.push(plan.target)
+            else if (i === plan.donorIdx) {
+              if (plan.donor) after.push(plan.donor)
+            } else after.push(s)
+          })
+          after.forEach((s, i) => (s.index = i))
+          const ver = verifyResult(job, { ...r, sheets: after }, 2)
+          ok = plan.donorEmptied && after.length === 1 && ver.ok
+          detail = `取空施主板=${plan.donorEmptied}，写回 ${after.length} 张，校验 ${ver.ok ? '通过' : ver.issues[0]?.detail}`
+        }
+      } else {
+        detail = '手工两张布局刀路重建失败'
+      }
+    } else {
+      detail = '基准排样不是 1 张，用例构造失效'
+    }
+    add('路线一板上对换：挪件入空块取空施主板→省一张且逐刀校验通过', ok, detail)
+  }
+
+  // 13) 按板汇总与结果页同源：行数=板数、件数合计=总件数、面积可复算
+  {
+    const job = makeJob([
+      makePart({ code: 'A', lenMm: 500, widMm: 400, qty: 3 }),
+      makePart({ code: 'B', lenMm: 300, widMm: 200, qty: 2 })
+    ])
+    const r = nestJob(job)
+    job.result = r
+    const rows = boardMaterialRows(r)
+    const pieces = rows.reduce((a, x) => a + x.pieces, 0)
+    const areaOk = rows.every(
+      (x) =>
+        Math.abs(x.usedAreaMm2 + x.wasteMm2 - x.boardAreaMm2) <= 1 &&
+        Math.abs(x.utilization - x.usedAreaMm2 / x.boardAreaMm2) < 1e-9
+    )
+    add(
+      '材料统计按板汇总与排样结果同源可复算',
+      rows.length === r.sheets.length && pieces === 5 && areaOk,
+      `${rows.length} 行、${pieces} 件、面积恒等式 ${areaOk ? '成立' : '不成立'}`
     )
   }
 

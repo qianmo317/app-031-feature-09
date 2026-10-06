@@ -1,9 +1,19 @@
 // 全局状态：Vue reactive 单例 + localStorage 持久化（无 Pinia/Vuex）
 import { reactive, computed } from 'vue'
-import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from '../types'
-import { nestJob } from './packing'
-import { rebuildFromPlacements } from './cuts'
+import type {
+  Board,
+  Job,
+  NestResult,
+  Part,
+  RegisteredOffcut,
+  SheetResult
+} from '../types'
+import { finalizeNestResult, nestJob, normalizeBoard } from './packing'
+import { rebuildFromPlacements, countSawOps } from './cuts'
 import { guillotineViolation } from './geometry'
+import { verifyResult } from './verify'
+import { inputSignature, planChainMove, planLocalMove } from './remix'
+import { refreshResultCaches } from './metrics'
 import { uid } from './format'
 import boardsData from '../data/boards.json'
 
@@ -35,8 +45,89 @@ const state = reactive<State>({
 })
 
 function persist(): void {
-  localStorage.setItem(JOBS_KEY, JSON.stringify(state.jobs))
-  localStorage.setItem(OFFCUTS_KEY, JSON.stringify(state.offcuts))
+  // 一次写成：先序列化，成功后同 tick 写两个键；任何一步抛错都不产生半份存档
+  const jobsJson = JSON.stringify(state.jobs)
+  const offcutsJson = JSON.stringify(state.offcuts)
+  localStorage.setItem(JOBS_KEY, jobsJson)
+  localStorage.setItem(OFFCUTS_KEY, offcutsJson)
+}
+
+/** 写后回读本机存档，确认存下的那一版与内存中是同一份（不一致则视为存档失败）。 */
+export function archiveMatches(job: Job): boolean {
+  try {
+    const raw = localStorage.getItem(JOBS_KEY)
+    if (!raw) return false
+    const parsed = JSON.parse(raw) as Job[]
+    const archived = parsed.find((j) => j.id === job.id)
+    if (!archived || !archived.result) return false
+    return archived.result.rev === job.result?.rev
+  } catch {
+    return false
+  }
+}
+
+export interface ConsistencySource {
+  key: string
+  label: string
+  ok: boolean
+  detail: string
+}
+export interface ConsistencyReport {
+  ok: boolean
+  rev: number
+  sources: ConsistencySource[]
+}
+
+/**
+ * 各处取数一致性核对（调板确认后自动跑一次）：
+ * - 排样结果页：走刀次数缓存须等于现算、余料面积缓存须等于现算、板数=sheets 数
+ * - 材料统计/打印单据标签：件数=Σ板上件数、按板种张数=Σ板数、成本=Σ板价、封边可复算
+ * - 本机存档：localStorage 里存下的那一版 rev 必须与内存相同（老数=存的不是这一版）
+ */
+export function auditConsistency(job: Job): ConsistencyReport | null {
+  const result = job.result
+  if (!result) return null
+  const sources: ConsistencySource[] = []
+  const add = (key: string, label: string, ok: boolean, detail: string): void => {
+    sources.push({ key, label, ok, detail })
+  }
+
+  // 结果页缓存
+  const sawLive = countSawOps(result.sheets)
+  add(
+    'nest',
+    '排样结果页（走刀/余料/利用率）',
+    (result.sawOps ?? sawLive) === sawLive && result.boardsUsed === result.sheets.length,
+    `走刀 ${sawLive} 次${result.sawOps === sawLive ? '' : `（缓存 ${result.sawOps}）`}、板数 ${result.sheets.length}`
+  )
+
+  // 统计页/打印共用派生数
+  const pieces = result.sheets.reduce((a, s) => a + s.placements.length, 0)
+  const byTypeSum = Object.values(result.boardsByType).reduce((a, n) => a + n, 0)
+  const costSum = result.sheets.reduce((a, s) => a + s.priceCents, 0)
+  const utilNet = result.sheets.every(
+    (s) =>
+      Math.abs(s.usedAreaMm2 - s.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)) <= 1 &&
+      Math.abs(s.utilization - s.usedAreaMm2 / s.boardAreaMm2) <= 1e-9
+  )
+  add(
+    'stats',
+    '材料统计（按板用料/余料、张数、成本）',
+    byTypeSum === result.sheets.length && costSum === result.totalCostCents && utilNet,
+    `${pieces} 件、${byTypeSum} 张、余料/利用率逐板可复算`
+  )
+  add(
+    'print',
+    '下料单与标签打印（板数/件数）',
+    byTypeSum === result.sheets.length,
+    `打印按 ${result.sheets.length} 张、标签 ${pieces} 张出`
+  )
+
+  // 本机存档
+  const archived = archiveMatches(job)
+  add('archive', '本机存档（存下的那一版）', archived, archived ? `rev ${result.rev} 已落盘` : '存档版本与当前不一致')
+
+  return { ok: sources.every((s) => s.ok), rev: result.rev ?? 0, sources }
 }
 
 function init(): void {
@@ -138,6 +229,36 @@ function boardsWithOffcuts(job: Job): Board[] {
   return [...offcutBoards, ...job.boards]
 }
 
+/** 本单排样实际使用的板池（含勾选的登记余料小板）。 */
+export function effectiveBoardsFor(job: Job): Board[] {
+  return boardsWithOffcuts(job).map(normalizeBoard)
+}
+
+/** 连锁试算还要把当前结果里已经用上的余料小板算进板池（它们已是“开了的板”）。 */
+export function effectiveBoardsForRemix(job: Job): Board[] {
+  const base = boardsWithOffcuts(job)
+  const known = new Set(base.map((b) => b.id))
+  if (job.result) {
+    for (const s of job.result.sheets) {
+      if (s.boardId.startsWith('offcut_') && !known.has(s.boardId)) {
+        base.push({
+          id: s.boardId,
+          name: s.boardName,
+          wMm: s.wMm,
+          hMm: s.hMm,
+          thicknessMm: s.thicknessMm,
+          material: s.material,
+          priceCents: 0,
+          quantity: 1,
+          kind: 'offcut'
+        })
+        known.add(s.boardId)
+      }
+    }
+  }
+  return base.map(normalizeBoard)
+}
+
 export function runNest(job: Job): NestResult {
   const effective: Job = { ...job, boards: boardsWithOffcuts(job) }
   const result = nestJob(effective)
@@ -151,28 +272,33 @@ export function runNest(job: Job): NestResult {
       oc.usedByJobId = job.id
     }
   }
+  result.rev = (job.result?.rev ?? 0) + 1
+  result.inputSig = inputSignature(job, effective.boards)
+  refreshResultCaches(result)
   job.result = result
   persist()
   return result
 }
 
-/** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */
+/** 手工微调：移动/交换后按同一条内核判定重校验；非法返回错误信息并整体回退。 */
 export function applyAdjustment(
   job: Job,
   sheetIndex: number,
   placements: SheetResult['placements']
 ): string | null {
   if (!job.result) return '尚未排样'
-  const sheet = job.result.sheets[sheetIndex]
-  const bounds = {
-    x: job.trimMm,
-    y: job.trimMm,
-    w: sheet.wMm - 2 * job.trimMm,
-    h: sheet.hMm - 2 * job.trimMm
-  }
+  const result = job.result
+  const snapshot = JSON.stringify(result)
+  const expectedPieces = result.sheets.reduce((a, s) => a + s.placements.length, 0)
+  const sheet = result.sheets[sheetIndex]
   const violation = guillotineViolation(
     placements.map((p) => ({ id: p.instanceId, x: p.x, y: p.y, w: p.lenMm, h: p.widMm })),
-    bounds,
+    {
+      x: job.trimMm,
+      y: job.trimMm,
+      w: sheet.wMm - 2 * job.trimMm,
+      h: sheet.hMm - 2 * job.trimMm
+    },
     job.kerfMm
   )
   if (violation) return violation
@@ -202,8 +328,195 @@ export function applyAdjustment(
   sheet.adjusted = true
   sheet.usedAreaMm2 = sheet.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
   sheet.utilization = sheet.usedAreaMm2 / sheet.boardAreaMm2
-  persist()
+  // 微调也挂同一条判定：逐板贯通/模拟/余隙/修边 + 件数守恒
+  const ver = verifyResult(job, result, expectedPieces)
+  if (!ver.ok) {
+    job.result = JSON.parse(snapshot)
+    return ver.issues[0]?.detail ?? '微调未通过内核校验，已回退'
+  }
+  result.rev = (result.rev ?? 0) + 1
+  recomputeAggregates(job)
+  refreshResultCaches(result)
+  try {
+    persist()
+  } catch (e) {
+    job.result = JSON.parse(snapshot)
+    return `存档写入失败，已回退：${(e as Error).message}`
+  }
   return null
+}
+
+/**
+ * 调板确认后重算全局汇总（板数、按板种张数、成本、封边、补采、随手排基线/省板）。
+ * 与 nestJob 的 finalizeNestResult 同一份实现，保证各处取数同源。
+ */
+function recomputeAggregates(job: Job): void {
+  if (!job.result) return
+  const result = job.result
+  const opened = new Map<string, number>()
+  for (const s of result.sheets) opened.set(s.boardId, (opened.get(s.boardId) ?? 0) + 1)
+  const fresh = finalizeNestResult(
+    job,
+    result.sheets,
+    result.unplaced,
+    opened,
+    result.elapsedMs,
+    result.generatedAt
+  )
+  // 保留当前版本/签名，覆盖其余汇总字段
+  const rev = result.rev
+  const sig = result.inputSig
+  Object.assign(result, fresh)
+  result.rev = rev
+  result.inputSig = sig
+}
+
+function finalizeSheetIndices(sheets: SheetResult[]): void {
+  sheets.forEach((s, i) => {
+    s.index = i
+  })
+}
+
+export interface RemixApplyOutcome {
+  ok: boolean
+  error?: string
+  rev?: number
+}
+
+/** 路线一确认：挪一件入空块。重算→同一条内核总校验→一次写回，出错整体回退。 */
+export function applyRemixLocal(job: Job, targetIdx: number, instanceId: string): RemixApplyOutcome {
+  if (!job.result) return { ok: false, error: '尚未排样' }
+  const result = job.result
+  // 幂等：同一版结果上该件已在目标板，直接返回，不再挪第二遍
+  if (result.sheets[targetIdx].placements.some((p) => p.instanceId === instanceId)) {
+    return { ok: true, rev: result.rev }
+  }
+  const expectedPieces = result.sheets.reduce((a, s) => a + s.placements.length, 0)
+  const snap = takeSnapshot(job)
+  const plan = planLocalMove(job, result, targetIdx, instanceId)
+  if ('error' in plan) return { ok: false, error: plan.error }
+
+  const sheets: SheetResult[] = []
+  result.sheets.forEach((s, i) => {
+    if (i === plan.targetIdx) sheets.push(plan.target)
+    else if (i === plan.donorIdx) {
+      if (plan.donor) sheets.push(plan.donor)
+    } else sheets.push(s)
+  })
+  finalizeSheetIndices(sheets)
+  const ver = verifyResult(job, { ...result, sheets }, expectedPieces)
+  if (!ver.ok) {
+    restoreSnapshot(job, snap)
+    return { ok: false, error: ver.issues.map((x) => x.detail).join('；') + '（已回退，结果未动）' }
+  }
+  result.sheets = sheets
+  if (plan.donorEmptied) remapRegisteredOffcutsForRemoval(job, plan.targetIdx, plan.donorIdx)
+  result.rev = (result.rev ?? 0) + 1
+  recomputeAggregates(job)
+  refreshResultCaches(result)
+  try {
+    persist()
+  } catch (e) {
+    restoreSnapshot(job, snap)
+    return { ok: false, error: `存档写入失败，已回退：${(e as Error).message}` }
+  }
+  return { ok: true, rev: result.rev }
+}
+
+/** 路线二确认：同板种连锁重排省板。重算→同一条内核总校验→一次写回，出错整体回退。 */
+export function applyRemixChain(job: Job, targetIdx: number): RemixApplyOutcome {
+  if (!job.result) return { ok: false, error: '尚未排样' }
+  const result = job.result
+  const expectedPieces = result.sheets.reduce((a, s) => a + s.placements.length, 0)
+  const snap = takeSnapshot(job)
+  const plan = planChainMove(job, result, targetIdx, effectiveBoardsForRemix(job))
+  if ('error' in plan) return { ok: false, error: plan.error }
+
+  const { groupIdxs, packed } = plan
+  const sheets: SheetResult[] = []
+  let pi = 0
+  result.sheets.forEach((s, i) => {
+    if (groupIdxs.includes(i)) {
+      if (pi < packed.length) sheets.push({ ...packed[pi] })
+      pi++
+    } else {
+      sheets.push(s)
+    }
+  })
+  finalizeSheetIndices(sheets)
+  const ver = verifyResult(job, { ...result, sheets }, expectedPieces)
+  if (!ver.ok) {
+    restoreSnapshot(job, snap)
+    return { ok: false, error: ver.issues.map((x) => x.detail).join('；') + '（已回退，结果未动）' }
+  }
+  result.sheets = sheets
+  remapRegisteredOffcutsForChain(job, result, groupIdxs, packed.length)
+  result.rev = (result.rev ?? 0) + 1
+  recomputeAggregates(job)
+  refreshResultCaches(result)
+  try {
+    persist()
+  } catch (e) {
+    restoreSnapshot(job, snap)
+    return { ok: false, error: `存档写入失败，已回退：${(e as Error).message}` }
+  }
+  return { ok: true, rev: result.rev }
+}
+
+interface ResultSnapshot {
+  resultJson: string
+  offcutsJson: string
+}
+
+function takeSnapshot(job: Job): ResultSnapshot {
+  return {
+    resultJson: JSON.stringify(job.result),
+    offcutsJson: JSON.stringify(state.offcuts)
+  }
+}
+
+/** 写到一半出错（或校验不过）时恢复原样：结果与余料台账都回到快照。 */
+function restoreSnapshot(job: Job, snap: ResultSnapshot): void {
+  job.result = JSON.parse(snap.resultJson) as NestResult
+  const restored = JSON.parse(snap.offcutsJson) as RegisteredOffcut[]
+  state.offcuts.splice(0, state.offcuts.length, ...restored)
+}
+
+/** 删除施主板后，把登记余料的板序号顺延（组内并到目标板序号）。 */
+function remapRegisteredOffcutsForRemoval(
+  job: Job,
+  targetIdx: number,
+  donorIdx: number
+): void {
+  const lo = Math.min(targetIdx, donorIdx)
+  const hi = Math.max(targetIdx, donorIdx)
+  for (const oc of state.offcuts) {
+    if (oc.jobId !== job.id) continue
+    if (oc.sheetIndex === hi) oc.sheetIndex = lo
+    else if (oc.sheetIndex > hi) oc.sheetIndex -= 1
+  }
+}
+
+/** 连锁重排后，组内板数变化时顺延登记余料序号（组外不动，组内并入首张待核对）。 */
+function remapRegisteredOffcutsForChain(
+  job: Job,
+  result: NestResult,
+  groupIdxs: number[],
+  newCount: number
+): void {
+  void result
+  const first = Math.min(...groupIdxs)
+  const last = Math.max(...groupIdxs)
+  for (const oc of state.offcuts) {
+    if (oc.jobId !== job.id) continue
+    if (oc.sheetIndex >= first && oc.sheetIndex <= last) {
+      // 余料位置已随重排变化，旧尺寸作废，序号并到组首张并置为不可用，提示重新核对
+      oc.sheetIndex = first
+      oc.available = false
+    } else if (oc.sheetIndex > last) {
+      oc.sheetIndex -= groupIdxs.length - newCount
+    }
+  }
 }
 
 export function registerOffcuts(
