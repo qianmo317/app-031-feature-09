@@ -130,7 +130,8 @@ function onFile(e: Event): void {
         </span>
         <span class="muted small">
           覆盖：100 组 guillotine 零反例、纹理零旋转、锯路/修边、守恒、封边复算、
-          30 件 ≤20 刀且逐刀模拟还原、余料再利用、300 件 &lt;1.5s、微调合法性
+          30 件 ≤20 刀且逐刀模拟还原、余料再利用、300 件 &lt;1.5s、微调合法性、
+          省板建议（同板对换不省板/跨板连锁真省板/防重复确认/取数同源）
         </span>
       </div>
       <table v-if="report" class="grid" style="margin-top: 10px">

@@ -1,23 +1,56 @@
-// 通用工具：ID、金额、面积格式化、文件下载、CSV 解析
+// 通用工具：ID、金额、面积、利用率格式化、文件下载、CSV 解析
+//
+// 全应用统一的单位与精度口径（省板建议/材料统计/打印/存档都用这里）：
+// - 长度/尺寸/坐标展示：毫米 mm 整数（刀路坐标保留 1 位小数）
+// - 面积内部一律按平方毫米 mm² 累加，展示换算成平方米 m²，保留 2 位小数
+// - 利用率保留 1 位小数（如 68.3%）；余料面积展示 m² 保留 2 位小数
+// - 金额（元）保留 2 位小数；封边米数 m 保留 2 位小数
+export const PRECISION = {
+  mmDigits: 0,
+  cutMmDigits: 1,
+  areaM2Digits: 2,
+  pctDigits: 1,
+  moneyDigits: 2,
+  edgeMDigits: 2
+} as const
+
+/** 利用率下限默认值（百分比，1 位小数口径）；低于它的板进省板建议。 */
+export const DEFAULT_LOW_UTIL_FLOOR_PCT = 70
 
 export function uid(prefix = 'id'): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 }
 
 export function money(cents: number): string {
-  return `¥${(cents / 100).toFixed(2)}`
+  return `¥${(cents / 100).toFixed(PRECISION.moneyDigits)}`
 }
 
 export function mm(v: number): string {
   return `${Math.round(v)}`
 }
 
+/** 刀路坐标：mm，保留 1 位小数 */
+export function cutMm(v: number): string {
+  return `${v.toFixed(PRECISION.cutMmDigits)}`
+}
+
+/** 平方毫米 → 平方米文本，保留 2 位小数 */
 export function areaM2(mm2: number): string {
-  return `${(mm2 / 1_000_000).toFixed(2)}m²`
+  return `${(mm2 / 1_000_000).toFixed(PRECISION.areaM2Digits)}m²`
+}
+
+/** 平方毫米 → 平方米数值，保留 2 位小数 */
+export function toM2(mm2: number): number {
+  return Number((mm2 / 1_000_000).toFixed(PRECISION.areaM2Digits))
 }
 
 export function pct(v: number): string {
-  return `${(v * 100).toFixed(1)}%`
+  return `${(v * 100).toFixed(PRECISION.pctDigits)}%`
+}
+
+/** 百分比输入（70 表示 70%）→ 比例 */
+export function floorToRatio(pctValue: number): number {
+  return Math.min(1, Math.max(0, pctValue / 100))
 }
 
 export function clamp(v: number, lo: number, hi: number): number {

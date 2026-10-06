@@ -4,6 +4,15 @@ import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from
 import { nestJob } from './packing'
 import { rebuildFromPlacements } from './cuts'
 import { guillotineViolation } from './geometry'
+import {
+  buildPlan,
+  composeResult,
+  planStillCurrent,
+  validateResult,
+  type OptimizePlan,
+  type RouteId,
+  type RouteTrial
+} from './optimize'
 import { uid } from './format'
 import boardsData from '../data/boards.json'
 
@@ -230,6 +239,90 @@ export function registerOffcuts(
   }
   persist()
   return n
+}
+
+export interface ApplyOptimizationResult {
+  ok: boolean
+  error?: string
+  newResult?: NestResult
+}
+
+/**
+ * 省板建议确认：试算只出建议，真重排在这里一次写成。
+ * - 计划必须仍对应当前结果（签名一致），重复点确认不会把同一件挪第二遍；
+ * - 先用排样内核同一条判定（余隙/锯路/修边/guillotine/逐刀模拟）校验新结果；
+ * - 整批快照后一次性替换 job.result 并持久化，任何一步抛错/校验失败都回退到原样；
+ * - 被省掉的余料小板若因此重新空出，对称恢复其可用状态，出错一并回滚。
+ */
+export function applyOptimization(
+  job: Job,
+  route: RouteId,
+  trial: RouteTrial,
+  floorPct: number
+): ApplyOptimizationResult {
+  if (!job.result) return { ok: false, error: '尚未排样' }
+  if (!trial.feasible) return { ok: false, error: '该方案试算不成立，未做任何改动' }
+  const plan: OptimizePlan = buildPlan(job.result, route, trial, floorPct)
+  if (!planStillCurrent(job.result, plan)) {
+    return { ok: false, error: '排样结果在试算后已变动（微调/重排/登记余料），请重新试算；本次未改动' }
+  }
+
+  // 快照（整批回退用）
+  const resultSnapshot = job.result
+  const offcutSnapshot = state.offcuts.map((o) => ({ ...o }))
+
+  let candidate: NestResult
+  try {
+    candidate = composeResult(job, resultSnapshot, plan)
+    // 同一套判定复核：余隙、四周修边、贯通合法性、逐刀模拟还原、件数守恒
+    const issues = validateResult(job, candidate)
+    if (issues.length > 0) {
+      throw new Error(
+        issues
+          .slice(0, 4)
+          .map((i) => (i.sheetIndex >= 0 ? `第 ${i.sheetIndex + 1} 张：${i.error}` : i.error))
+          .join('；')
+      )
+    }
+    // 路 B 必须真的少板；路 A 板数必须不变（多板一律视为失败）
+    if (route === 'chainSheets' && candidate.sheets.length >= resultSnapshot.sheets.length) {
+      throw new Error('重排后板数未减少，拒绝回写')
+    }
+    if (route === 'swapLocal' && candidate.sheets.length !== resultSnapshot.sheets.length) {
+      throw new Error('同板对换不应改变板数，拒绝回写')
+    }
+    // 一次性替换 + 持久化（中间出错下面回退）
+    job.result = candidate
+    syncOffcutAvailability(job, resultSnapshot)
+    persist()
+  } catch (e) {
+    // 回退到原样
+    job.result = resultSnapshot
+    state.offcuts.splice(0, state.offcuts.length, ...offcutSnapshot)
+    return { ok: false, error: `重排复核未通过，已回退到原样：${(e as Error).message}` }
+  }
+  return { ok: true, newResult: candidate }
+}
+
+/** 重排后余料小板占用变化：新结果里没出现、旧结果里出现的余料板重新变为可用。 */
+function syncOffcutAvailability(job: Job, old: NestResult): void {
+  const oldOffcutIds = new Set(
+    old.sheets.filter((s) => s.boardId.startsWith('offcut_')).map((s) => s.boardId)
+  )
+  const newOffcutIds = new Set(
+    job.result!.sheets.filter((s) => s.boardId.startsWith('offcut_')).map((s) => s.boardId)
+  )
+  for (const oc of state.offcuts) {
+    const boardId = `offcut_${oc.id}`
+    if (oldOffcutIds.has(boardId) && !newOffcutIds.has(boardId)) {
+      oc.available = true
+      oc.usedByJobId = undefined
+    }
+    if (newOffcutIds.has(boardId)) {
+      oc.available = false
+      oc.usedByJobId = job.id
+    }
+  }
 }
 
 export function addManualOffcut(input: {

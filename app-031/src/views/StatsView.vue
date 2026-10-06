@@ -48,6 +48,31 @@ const utilMinMax = computed(() => {
   if (us.length === 0) return { min: 0, max: 0 }
   return { min: Math.min(...us), max: Math.max(...us) }
 })
+
+// 按板汇总用料与余料（与排样结果页/打印逐板同源）
+const perSheetRows = computed(() => {
+  return (result.value?.sheets ?? []).map((s) => {
+    const usedM2 = s.usedAreaMm2 / 1e6
+    const boardM2 = s.boardAreaMm2 / 1e6
+    const usableOff = s.offcuts.filter((o) => o.usable)
+    // 板上除零件净面积、≥300×300 可登记余料之外的部分（锯路/修边/碎料）
+    const restMm2 = s.boardAreaMm2 - s.usedAreaMm2 - usableOff.reduce((a, o) => a + o.areaMm2, 0)
+    return {
+      index: s.index + 1,
+      name: s.boardName,
+      w: s.wMm,
+      h: s.hMm,
+      usedM2,
+      boardM2,
+      utilization: s.utilization,
+      usableM2: usableOff.reduce((a, o) => a + o.areaMm2, 0) / 1e6,
+      usableCount: usableOff.length,
+      scrapM2: Math.max(0, restMm2) / 1e6
+    }
+  })
+})
+const totalUsableM2 = computed(() => perSheetRows.value.reduce((a, r) => a + r.usableM2, 0))
+const totalScrapM2 = computed(() => perSheetRows.value.reduce((a, r) => a + r.scrapM2, 0))
 </script>
 
 <template>
@@ -76,6 +101,42 @@ const utilMinMax = computed(() => {
     </div>
 
     <div class="stat-grid">
+      <section class="panel" style="grid-column: 1 / -1">
+        <h3>按板汇总用料与余料（与排样结果页、打印单据同源）</h3>
+        <table class="grid">
+          <thead>
+            <tr>
+              <th>板号</th><th>板材/规格(mm)</th><th>板面积</th><th>零件净用料</th>
+              <th>利用率</th><th>可再用余料</th><th>锯路/修边/碎料</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in perSheetRows" :key="r.index">
+              <td>第 {{ r.index }} 张</td>
+              <td>{{ r.name }}<br /><span class="small muted">{{ r.w }}×{{ r.h }}</span></td>
+              <td>{{ r.boardM2.toFixed(2) }}m²</td>
+              <td>{{ r.usedM2.toFixed(2) }}m²</td>
+              <td>{{ pct(r.utilization) }}</td>
+              <td>{{ r.usableCount }} 块 / {{ r.usableM2.toFixed(2) }}m²</td>
+              <td>{{ r.scrapM2.toFixed(2) }}m²</td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr>
+              <td colspan="3"><b>合计 {{ perSheetRows.length }} 张</b></td>
+              <td><b>{{ perSheetRows.reduce((a, r) => a + r.usedM2, 0).toFixed(2) }}m²</b></td>
+              <td>{{ pct(overallUtil) }}</td>
+              <td><b>{{ totalUsableM2.toFixed(2) }}m²</b></td>
+              <td>{{ totalScrapM2.toFixed(2) }}m²</td>
+            </tr>
+          </tfoot>
+        </table>
+        <p class="small muted" style="margin-top: 6px">
+          面积按平方毫米累加后换算平方米，保留 2 位小数；利用率保留 1 位小数（分子=零件净面积，不含锯路）；
+          尺寸/刀位按毫米整数展示（刀路坐标保留 1 位小数）；金额保留 2 位小数。
+        </p>
+      </section>
+
       <section class="panel">
         <h3>板材领料</h3>
         <table class="grid">

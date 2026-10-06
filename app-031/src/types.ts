@@ -110,6 +110,8 @@ export interface NestResult {
   stockShortage: { boardId: string; boardName: string; need: number; have: number }[]
   elapsedMs: number
   generatedAt: number
+  // 经「省板建议」确认重排后置位（重新整体排样/手工微调不清除，便于存档辨认）
+  optimized?: boolean
 }
 
 export interface Job {

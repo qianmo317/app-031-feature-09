@@ -2,9 +2,17 @@
 // guillotine 100 组随机零反例、纹理零旋转、锯路/修边、守恒、封边复算、
 // 30 零件锯切工步 ≤20 且模拟器还原、余料再利用、300 零件性能 <1.5s。
 import type { Board, Job, Part } from '../types'
-import { nestJob } from './packing'
+import { nestJob, mulberry32 } from './packing'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import {
+  analyzeLowSheets,
+  buildPlan,
+  composeResult,
+  planStillCurrent,
+  validateResult,
+  auditResultConsistency
+} from './optimize'
 
 export interface CheckResult {
   name: string
@@ -18,18 +26,27 @@ export interface SelfTestReport {
   checks: CheckResult[]
 }
 
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0
-  return () => {
-    a |= 0
-    a = (a + 0x6d2b79f5) | 0
-    let t = Math.imul(a ^ (a >>> 15), 1 | a)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+/** 与省板试算搜索一致的确定性造例（先抽 kinds，再抽每件）。 */
+function makeSeededJob(seed: number, over: Partial<Job> = {}): { job: Job; parts: Part[] } {
+  const rng = mulberry32(seed)
+  const kinds = 8 + Math.floor(rng() * 20)
+  const parts: Part[] = []
+  for (let i = 0; i < kinds; i++) {
+    const l = 200 + Math.floor(rng() * 1500)
+    const w = 120 + Math.floor(rng() * 900)
+    const g = rng()
+    parts.push(
+      makePart({
+        code: `S${i}`,
+        lenMm: l,
+        widMm: w,
+        qty: 1 + Math.floor(rng() * 3),
+        grain: g < 0.35 ? 'length' : g < 0.5 ? 'width' : 'none'
+      })
+    )
   }
-}
-
-let boardSeq = 0
+  return { job: makeJob(parts, over), parts }
+}let boardSeq = 0
 let partSeq = 0
 
 function makeBoard(over: Partial<Board> = {}): Board {
@@ -438,6 +455,79 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 省板建议：路 B 跨板连锁真省一张、同条内核判定、件数守恒、对账同源、防重复确认
+  {
+    const { job } = makeSeededJob(86 * 7919 + 13)
+    const r = nestJob(job)
+    job.result = r
+    const before = r.sheets.length
+    const report = analyzeLowSheets(job, r, { floorPct: 70 })
+    const chain = report.bestChain?.trial
+    const composed = chain ? composeResult(job, r, buildPlan(r, 'chainSheets', chain, 70)) : null
+    const issues = composed ? validateResult(job, composed) : ['未找到可行路 B']
+    const partTotal = job.parts.reduce((a, p) => a + p.qty, 0)
+    const placed = composed ? composed.sheets.reduce((a, s) => a + s.placements.length, 0) : 0
+    const audit = composed ? auditResultConsistency(composed, composed) : []
+    const planStale = chain ? !planStillCurrent(r, buildPlan(r, 'chainSheets', chain, 70)) : false
+    const ok =
+      !!chain &&
+      chain.boardsDelta === -1 &&
+      composed!.sheets.length === before - 1 &&
+      issues.length === 0 &&
+      placed === partTotal &&
+      audit.every((i) => i.ok) &&
+      !planStale
+    add(
+      '省板建议：跨板连锁可真省一张，逐刀/余隙/修边复核通过且五处取数同源',
+      ok,
+      !chain
+        ? `默认 ${before} 张但未找到省板路`
+        : `${before} → ${composed!.sheets.length} 张，走刀 ${countSawOps(r.sheets)} → ${countSawOps(composed!.sheets)}，件 ${placed}/${partTotal}，校验 ${issues.length === 0 ? '通过' : issues.slice(0, 2).join('；')}`
+    )
+  }
+
+  // 11) 路 A 同板对换不改变板数（代价已认下）；每张低于下限的板都带空档/挪件诊断
+  {
+    const job2 = makeJob([
+      makePart({ code: 'A', lenMm: 1200, widMm: 1190, grain: 'length' }),
+      makePart({ code: 'B', lenMm: 1190, widMm: 1190 }),
+      makePart({ code: 'C', lenMm: 400, widMm: 300 }),
+      makePart({ code: 'D', lenMm: 300, widMm: 250 })
+    ])
+    const r2 = nestJob(job2)
+    job2.result = r2
+    const rep2 = analyzeLowSheets(job2, r2, { floorPct: 70 })
+    const localDeltas = rep2.advices.map((a) => a.local.boardsDelta)
+    const everySheetHasVoidDiag = rep2.advices.every(
+      (a) => a.voids.length > 0 && a.voids.every((v) => v.bestMover || v.blockReason)
+    )
+    const ok =
+      rep2.advices.length === 1 &&
+      localDeltas.every((d) => d === 0) &&
+      everySheetHasVoidDiag
+    add(
+      '同板对换板数恒不变且每块空档都给出可挪件或挪不进原因',
+      ok,
+      `低利用板 ${rep2.advices.length} 张（2 张中板 2 利用率 ${Math.round((r2.sheets[1]?.utilization ?? 0) * 100)}%），路 A 板数变化 [${localDeltas.join(',')}]，空档诊断 ${everySheetHasVoidDiag ? '齐全' : '缺失'}`
+    )
+  }
+
+  // 12) 没有低于下限的板 / 一张板都没排下：建议行为为空
+  {
+    const full = makeJob([makePart({ code: 'F', lenMm: 2380, widMm: 1180, grain: 'length' })])
+    const rf = nestJob(full)
+    full.result = rf
+    const repFull = analyzeLowSheets(full, rf, { floorPct: 70 })
+    const empty = makeJob([makePart({ code: 'X', lenMm: 3000, widMm: 2000, grain: 'length' })])
+    const re0 = nestJob(empty)
+    const ok = repFull.belowCount === 0 && re0.sheets.length === 0
+    add(
+      '没有低于下限的板时不出建议行；一张板都没排下时无板可挑',
+      ok,
+      `高利用板批次低利用数 ${repFull.belowCount}；超大件结果板数 ${re0.sheets.length}`
     )
   }
 

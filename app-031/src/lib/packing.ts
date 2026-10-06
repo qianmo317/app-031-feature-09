@@ -21,6 +21,61 @@ interface Inst {
   k: number // 第 k 件（qty 展开）
   key: string
   cabinet: string
+  score: number // 随机策略用（默认策略恒为 0）
+}
+
+/**
+ * 排序策略：只改变零件进入装箱的顺序，不改变任何合法性判定
+ * （纹理朝向、余隙 ≥ 锯路、修边区、guillotine 拆分全部沿用同一套代码）。
+ * 省板试算时多路搜索，命中更优解的机会更大。
+ */
+export interface NestStrategy {
+  id: string
+  label: string
+  shuffle?: boolean
+}
+
+export const NEST_STRATEGIES: NestStrategy[] = [
+  { id: 'default', label: '大边降序（默认）' },
+  { id: 'minEdge', label: '短边降序' },
+  { id: 'area', label: '面积降序' },
+  { id: 'width', label: '宽边降序' },
+  { id: 'shuffle-a', label: '固定乱序 A', shuffle: true },
+  { id: 'shuffle-b', label: '固定乱序 B', shuffle: true },
+  { id: 'shuffle-c', label: '固定乱序 C', shuffle: true },
+  { id: 'shuffle-d', label: '固定乱序 D', shuffle: true }
+]
+
+/** 确定性 PRNG：同一策略同一任务结果可复现，不会每次点确认都变。 */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+function compareInsts(a: Inst, b: Inst, strategy: NestStrategy): number {
+  if (a.cabinet !== b.cabinet) return a.cabinet < b.cabinet ? -1 : 1
+  if (strategy.shuffle) {
+    if (a.score !== b.score) return a.score - b.score
+  } else if (strategy.id === 'minEdge') {
+    const am = Math.min(a.part.lenMm, a.part.widMm)
+    const bm = Math.min(b.part.lenMm, b.part.widMm)
+    if (bm !== am) return bm - am
+  } else if (strategy.id === 'width') {
+    if (b.part.widMm !== a.part.widMm) return b.part.widMm - a.part.widMm
+  }
+  const am = Math.max(a.part.lenMm, a.part.widMm)
+  const bm = Math.max(b.part.lenMm, b.part.widMm)
+  if (bm !== am) return bm - am
+  const areaDiff = b.part.lenMm * b.part.widMm - a.part.lenMm * a.part.widMm
+  if (areaDiff !== 0 && strategy.id !== 'area') return areaDiff
+  if (strategy.id === 'area' && areaDiff !== 0) return areaDiff
+  return a.key < b.key ? -1 : 1
 }
 
 interface FRect extends Rect {
@@ -51,11 +106,12 @@ interface SheetState {
   placements: Placement[]
 }
 
-function boardMatches(b: Board, p: Part): boolean {
+/** 板种兼容：不指定=任意板；指定=同板种；余料小板按厚度兼容。 */
+export function boardMatches(b: Board, p: Part, defs?: Map<string, Board>): boolean {
   if (!p.boardId) return true
   if (b.id === p.boardId) return true
   if (b.kind === 'offcut') {
-    const target = boardDefs.get(p.boardId)
+    const target = defs?.get(p.boardId) ?? boardDefs.get(p.boardId)
     return !!target && target.thicknessMm === b.thicknessMm
   }
   return false
@@ -69,8 +125,46 @@ function normalize(b: Board): Board {
   return { ...b, wMm: b.hMm, hMm: b.wMm }
 }
 
-export function nestJob(job: Job): NestResult {
+export interface Orient {
+  pw: number
+  ph: number
+  rotated: boolean
+}
+
+/** 该零件允许的朝向：纹理件恒为固定朝向（rotated=false），无纹理可转。 */
+export function orientsOf(p: Part): Orient[] {
+  if (p.grain === 'length') return [{ pw: p.lenMm, ph: p.widMm, rotated: false }]
+  if (p.grain === 'width') return [{ pw: p.widMm, ph: p.lenMm, rotated: false }]
+  if (p.lenMm === p.widMm) return [{ pw: p.lenMm, ph: p.widMm, rotated: false }]
+  return [
+    { pw: p.lenMm, ph: p.widMm, rotated: false },
+    { pw: p.widMm, ph: p.lenMm, rotated: true }
+  ]
+}
+
+/** 余隙判定：只允许严丝合缝（0）或余隙 ≥ 锯路；0<余隙<锯路 时下不了刀，禁止放入。 */
+export function fitsClean(avail: number, size: number, kerf: number): boolean {
+  const gap = avail - size
+  return gap >= -EPS && (gap <= EPS || gap >= kerf - EPS)
+}
+
+export interface NestOptions {
+  strategyId?: string
+}
+
+function hashSeed(s: string): number {
+  let h = 2166136261
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
+}
+
+export function nestJob(job: Job, opts: NestOptions = {}): NestResult {
   const t0 = performance.now()
+  const strategy =
+    NEST_STRATEGIES.find((s) => s.id === opts.strategyId) ?? NEST_STRATEGIES[0]
   boardDefs.clear()
   const boards = job.boards.map(normalize)
   boards.forEach((b) => boardDefs.set(b.id, b))
@@ -84,16 +178,24 @@ export function nestJob(job: Job): NestResult {
   const insts: Inst[] = []
   for (const p of job.parts) {
     for (let k = 1; k <= Math.max(0, p.qty); k++) {
-      insts.push({ part: p, k, key: `${p.id}#${k}`, cabinet: p.cabinet || '未分组' })
+      insts.push({
+        part: p,
+        k,
+        key: `${p.id}#${k}`,
+        cabinet: p.cabinet || '未分组',
+        score: 0
+      })
     }
   }
-  // 排序：按柜体批次分组时柜体优先；随后大边降序、面积降序
+  if (strategy.shuffle) {
+    const rng = mulberry32(hashSeed(strategy.id) ^ insts.length)
+    for (const i of insts) i.score = rng()
+  }
+  // 排序：按柜体批次分组时柜体优先；随后按策略（默认大边降序、面积降序）
+  const batchCabinet = job.batchByCabinet
   const sorted = [...insts].sort((a, b) => {
-    if (job.batchByCabinet && a.cabinet !== b.cabinet) return a.cabinet < b.cabinet ? -1 : 1
-    const am = Math.max(a.part.lenMm, a.part.widMm)
-    const bm = Math.max(b.part.lenMm, b.part.widMm)
-    if (bm !== am) return bm - am
-    return b.part.lenMm * b.part.widMm - a.part.lenMm * a.part.widMm
+    if (batchCabinet && a.cabinet !== b.cabinet) return a.cabinet < b.cabinet ? -1 : 1
+    return compareInsts(a, b, strategy)
   })
 
   const sheets: SheetState[] = []
@@ -141,8 +243,8 @@ export function nestJob(job: Job): NestResult {
       (b) =>
         canOpen(b) &&
         boardMatches(b, p) &&
-        fitsClean(b.wMm - 2 * trim, pw) &&
-        fitsClean(b.hMm - 2 * trim, ph)
+        fitsClean(b.wMm - 2 * trim, pw, kerf) &&
+        fitsClean(b.hMm - 2 * trim, ph, kerf)
     )
     // 余料小板优先，其次选面积最小的（省大板）
     viable.sort((a, b) => {
@@ -150,26 +252,6 @@ export function nestJob(job: Job): NestResult {
       return a.wMm * a.hMm - b.wMm * b.hMm
     })
     return viable[0] ?? null
-  }
-
-  interface Orient {
-    pw: number
-    ph: number
-    rotated: boolean
-  }
-  // 只允许严丝合缝（0）或余隙 ≥ 锯路；0<余隙<锯路 时下不了刀，禁止放入
-  const fitsClean = (avail: number, size: number): boolean => {
-    const gap = avail - size
-    return gap >= -EPS && (gap <= EPS || gap >= kerf - EPS)
-  }
-  const orientsOf = (p: Part): Orient[] => {
-    if (p.grain === 'length') return [{ pw: p.lenMm, ph: p.widMm, rotated: false }]
-    if (p.grain === 'width') return [{ pw: p.widMm, ph: p.lenMm, rotated: false }]
-    if (p.lenMm === p.widMm) return [{ pw: p.lenMm, ph: p.widMm, rotated: false }]
-    return [
-      { pw: p.lenMm, ph: p.widMm, rotated: false },
-      { pw: p.widMm, ph: p.lenMm, rotated: true }
-    ]
   }
 
   const unplaced = new Map<string, { part: Part; qty: number }>()
@@ -190,7 +272,7 @@ export function nestJob(job: Job): NestResult {
       for (const s of sheets) {
         if (!boardMatches(s.board, p)) continue
         for (const fr of s.free) {
-          if (fitsClean(fr.w, o.pw) && fitsClean(fr.h, o.ph)) {
+          if (fitsClean(fr.w, o.pw, kerf) && fitsClean(fr.h, o.ph, kerf)) {
             const waste = fr.w * fr.h - o.pw * o.ph
             if (!best || waste < best.waste) {
               best = { sheet: s, fr, nb: null, o, tier: 0, waste }
@@ -338,29 +420,21 @@ export function nestJob(job: Job): NestResult {
   // 组装 SheetResult
   const results: SheetResult[] = sheets.map((s) => buildSheet(s, kerf, trim))
 
-  // 统计
-  const boardsByType: Record<string, number> = {}
-  let totalCost = 0
-  for (const s of results) {
-    boardsByType[s.boardName] = (boardsByType[s.boardName] ?? 0) + 1
-    totalCost += s.priceCents
-  }
-  let exposedM = 0
-  let normalM = 0
-  for (const s of results) {
-    for (const pl of s.placements) {
-      const m =
-        (pl.origLen *
-          ((pl.edgeBands.includes('top') ? 1 : 0) + (pl.edgeBands.includes('bottom') ? 1 : 0)) +
-          pl.origWid *
-            ((pl.edgeBands.includes('left') ? 1 : 0) + (pl.edgeBands.includes('right') ? 1 : 0))) /
-        1000
-      if (pl.exposed) exposedM += m
-      else normalM += m
-    }
-  }
+  // 统计汇总（与省板重排共用同一条出口，避免两处算两套数）
+  return summarizeResult({
+    sheets: results,
+    boards,
+    unplacedList: unplacedListFromMap(unplaced),
+    baselineBoards: shelfBaseline(job, boards, kerf, trim, results.length),
+    elapsedMs: Math.round(performance.now() - t0),
+    generatedAt: Date.now()
+  })
+}
 
-  const unplacedList: UnplacedInfo[] = [...unplaced.values()].map((u) => ({
+function unplacedListFromMap(
+  unplaced: Map<string, { part: Part; qty: number }>
+): UnplacedInfo[] {
+  return [...unplaced.values()].map((u) => ({
     partId: u.part.id,
     code: u.part.code,
     name: u.part.name,
@@ -372,10 +446,52 @@ export function nestJob(job: Job): NestResult {
           ? '因纹理要求为竖纹（不可旋转），现有板材排不下'
           : '因纹理要求为横纹（不可旋转），现有板材排不下'
   }))
+}
 
-  const baselineBoards = shelfBaseline(job, boards, kerf, trim, results.length)
-  const optimizedBoards = results.length
-  const savedBoards = Math.max(0, baselineBoards - optimizedBoards)
+export interface SummarizeInput {
+  sheets: SheetResult[]
+  /** 本批实际可用板（含余料小板）；库存张数取自这里 */
+  boards: Board[]
+  unplacedList: UnplacedInfo[]
+  baselineBoards: number
+  elapsedMs: number
+  generatedAt: number
+  /** 沿用旧结果的「随手排」基线（省板重排时），不传则等于现张数（不重算基线） */
+  keepBaseline?: boolean
+  optimized?: boolean
+}
+
+/**
+ * 结果汇总唯一出口：板数、按板种汇总、封边米数、成本、库存补采、省板数都在这里算。
+ * 排样内核首次出结果与「省板建议」确认后的拼装结果走同一个函数，
+ * 保证材料统计页/打印/存档各处拿到的数同源。
+ */
+export function summarizeResult(inp: SummarizeInput): NestResult {
+  const { sheets, boards } = inp
+  const boardsByType: Record<string, number> = {}
+  let totalCost = 0
+  const openedCount = new Map<string, number>()
+  for (const s of sheets) {
+    boardsByType[s.boardName] = (boardsByType[s.boardName] ?? 0) + 1
+    totalCost += s.priceCents
+    openedCount.set(s.boardId, (openedCount.get(s.boardId) ?? 0) + 1)
+  }
+  let exposedM = 0
+  let normalM = 0
+  for (const s of sheets) {
+    for (const pl of s.placements) {
+      const m =
+        (pl.origLen *
+          ((pl.edgeBands.includes('top') ? 1 : 0) + (pl.edgeBands.includes('bottom') ? 1 : 0)) +
+          pl.origWid *
+            ((pl.edgeBands.includes('left') ? 1 : 0) + (pl.edgeBands.includes('right') ? 1 : 0))) /
+        1000
+      if (pl.exposed) exposedM += m
+      else normalM += m
+    }
+  }
+  const baselineBoards = inp.keepBaseline ? inp.baselineBoards : Math.max(inp.baselineBoards, sheets.length)
+  const savedBoards = Math.max(0, baselineBoards - sheets.length)
   const stockShortage = boards
     .filter((b) => b.kind !== 'offcut' && b.quantity > 0)
     .map((b) => ({
@@ -386,28 +502,29 @@ export function nestJob(job: Job): NestResult {
     }))
     .filter((x) => x.need > x.have)
 
-  const stockUsed = results.filter((s) => s.priceCents > 0)
+  const stockUsed = sheets.filter((s) => s.priceCents > 0)
   const avgPrice =
     stockUsed.length > 0
       ? stockUsed.reduce((a, s) => a + s.priceCents, 0) / stockUsed.length
-      : job.boards.reduce((a, b) => a + b.priceCents, 0) / Math.max(1, job.boards.length)
+      : boards.reduce((a, b) => a + b.priceCents, 0) / Math.max(1, boards.length)
 
   return {
-    sheets: results,
-    boardsUsed: optimizedBoards,
+    sheets,
+    boardsUsed: sheets.length,
     boardsByType,
     edgeBandM: {
       exposed: Math.round(exposedM * 100) / 100,
       normal: Math.round(normalM * 100) / 100
     },
-    unplaced: unplacedList,
+    unplaced: inp.unplacedList,
     baselineBoards,
     savedBoards,
     savedCents: Math.round(savedBoards * avgPrice),
     totalCostCents: totalCost,
     stockShortage,
-    elapsedMs: Math.round(performance.now() - t0),
-    generatedAt: Date.now()
+    elapsedMs: inp.elapsedMs,
+    generatedAt: inp.generatedAt,
+    optimized: inp.optimized
   }
 }
 
